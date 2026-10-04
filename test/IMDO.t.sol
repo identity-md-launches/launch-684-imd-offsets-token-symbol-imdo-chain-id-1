@@ -5040,7 +5040,7 @@ interface IHookPermissions {
 abstract contract Asserts {
     Vm internal constant vm = Vm(address(uint160(uint256(keccak256("hevm cheat code")))));
     address internal constant TREASURY = 0xb1eC9d1C36974d05eb9889eBf8A150b05791E559;
-    uint256 internal constant SUPPLY = 1_000_000 ether;
+    uint256 internal constant SUPPLY = 1_000_000_000 ether; // 10^27: one billion IMDO, 18 decimals
     uint256 internal constant PPM = 1_000_000;
     uint160 internal constant EXPECTED_FLAGS = 0x25d4;
     uint160 internal constant FLAG_MASK = (1 << 14) - 1;
@@ -5534,6 +5534,7 @@ contract IMDOTokenTest is Asserts {
         assertTrue(keccak256(bytes(token.symbol())) == keccak256("IMDO"), "symbol");
         assertEq(uint256(token.decimals()), 18, "decimals");
         assertEq(token.totalSupply(), SUPPLY, "supply");
+        assertEq(token.totalSupply(), 1e27, "supply is exactly 10^27 (one billion tokens at 18 decimals)");
         assertEq(token.INITIAL_SUPPLY(), SUPPLY, "initial supply constant");
         assertEq(token.balanceOf(address(this)), SUPPLY, "deployer holds the whole supply");
     }
