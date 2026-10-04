@@ -140,7 +140,8 @@ contract IMDOFeeHook {
     /// @notice One tx.origin's sells in the current transaction (transient; gone at tx end).
     /// @dev Invariant after every leg: ethPaid <= ceil(ethBasis * rate / PPM) and
     ///      tokenPaid <= ceil(tokenBasis * rate / PPM), where rate is the bracket of `sold`.
-    ///      The difference is the shortfall still owed and collected on the next leg.
+    ///      The difference is the shortfall still owed; later legs collect it, each one
+    ///      bounded by MAX_FEE_PPM of its own basis.
     struct Ledger {
         uint256 sold; // IMDO actually paid into the pool, all legs
         uint256 ethBasis; // gross ETH output of exact-input legs (fee basis in ETH)
@@ -258,6 +259,11 @@ contract IMDOFeeHook {
         uint256 protocolFee = poolManager.protocolFeesAccrued(Currency.wrap(token)) - _load(PROTOCOL_SLOT);
         _store(PROTOCOL_SLOT, 0);
         int128 tokenDelta = _amount1(delta);
+        // Sizing reserve: the one-block-lagged snapshot, or this pool's booked reserve
+        // just before this swap when that is LOWER. Liquidity parked across a block
+        // boundary and withdrawn before selling therefore no longer counts.
+        _rollReserve();
+        uint256 sizingReserve = tokenReserve < laggedTokenReserve ? tokenReserve : laggedTokenReserve;
         _updateReserve(tokenDelta);
         tokenReserve -= protocolFee;
 
@@ -269,7 +275,7 @@ contract IMDOFeeHook {
         uint256 legEth = ethDelta > 0 ? uint256(uint128(ethDelta)) : 0;
         bool exactInput = params.amountSpecified < 0;
         // tx.origin groups volume for cumulative billing; it grants NO authority.
-        (uint24 rate, uint256 fee, uint256 cumulative) = _bill(tx.origin, exactInput, sold, legEth);
+        (uint24 rate, uint256 fee, uint256 cumulative) = _bill(tx.origin, exactInput, sold, legEth, sizingReserve);
         if (fee == 0) return (this.afterSwap.selector, 0);
 
         bool claimed;
@@ -284,12 +290,12 @@ contract IMDOFeeHook {
         } else {
             // The v4 return delta can charge only the unspecified side. For exact
             // output sells this is IMDO input; it is destroyed, never distributed.
-            try this.takeAndBurn(fee, false) {}
-            catch {
-                poolManager.mint(address(this), uint160(token), fee);
-                pendingToken += fee;
-                claimed = true;
-            }
+            // It is ALWAYS booked as an ERC-6909 claim (BaseHookFee pattern) and burned
+            // by harvest(): taking real IMDO out of the manager mid-swap would lower the
+            // balance a pay-first (sync, transfer, swap, settle) swapper is credited from.
+            poolManager.mint(address(this), uint160(token), fee);
+            pendingToken += fee;
+            claimed = true;
         }
         emit SellFee(tx.origin, cumulative, rate, exactInput ? address(0) : token, fee, claimed);
         return (this.afterSwap.selector, int128(int256(fee)));
@@ -312,10 +318,14 @@ contract IMDOFeeHook {
     ///      legs are repriced when a later leg lifts the bracket. A leg can only charge
     ///      its unspecified currency: ETH on exact-input legs, IMDO on exact-output legs.
     ///      The other side's shortfall is converted at this leg's own realized price.
-    ///      An exact-input leg can never charge more than its gross ETH output (the
-    ///      swapper's ETH credit must stay nonnegative so routers settle normally); any
-    ///      remainder carries to the origin's next sell in the same transaction.
-    function _bill(address origin, bool exactInput, uint256 legSold, uint256 legEth)
+    ///      PER-SWAP CAP: no leg is ever charged more than ceil(its own basis *
+    ///      MAX_FEE_PPM / PPM): its gross ETH output for exact-input legs, its IMDO input
+    ///      for exact-output legs. afterSwap cannot see the end user, and several users'
+    ///      sells can share one tx.origin (bundlers, relayers, batch settlement), so a
+    ///      leg must never pay more than the hard cap on itself for volume that came
+    ///      before it. Any shortfall above that bound carries to the origin's next sell
+    ///      in the same transaction and is dropped when the transaction ends.
+    function _bill(address origin, bool exactInput, uint256 legSold, uint256 legEth, uint256 reserve)
         private
         returns (uint24 rate, uint256 fee, uint256 cumulative)
     {
@@ -325,9 +335,20 @@ contract IMDOFeeHook {
         if (exactInput) l.ethBasis += legEth;
         else l.tokenBasis += legSold;
 
-        rate = feePpm(l.sold, laggedTokenReserve);
+        rate = feePpm(l.sold, reserve);
         // Rate cap is unconditional; ceil is the BaseHookFee rounding convention.
         assert(rate <= MAX_FEE_PPM);
+        fee = _collect(l, exactInput, legSold, legEth, rate);
+        _storeLedger(base, l);
+        cumulative = l.sold;
+    }
+
+    /// @dev Shortfall collection for one leg; updates `l` in memory. See _bill.
+    function _collect(Ledger memory l, bool exactInput, uint256 legSold, uint256 legEth, uint24 rate)
+        private
+        pure
+        returns (uint256 fee)
+    {
         uint256 ethDue = _ceilPpm(l.ethBasis, rate);
         uint256 tokenDue = _ceilPpm(l.tokenBasis, rate);
         uint256 ethShort = ethDue > l.ethPaid ? ethDue - l.ethPaid : 0;
@@ -337,12 +358,13 @@ contract IMDOFeeHook {
             // IMDO shortfall priced in ETH at this leg's rate (legEth per legSold).
             uint256 converted = (tokenShort != 0 && legEth != 0) ? _ceilDiv(tokenShort * legEth, legSold) : 0;
             uint256 want = ethShort + converted;
-            if (want <= legEth) {
+            uint256 cap = _ceilPpm(legEth, MAX_FEE_PPM); // <= legEth: ETH credit stays nonnegative
+            if (want <= cap) {
                 fee = want;
                 l.ethPaid = ethDue;
                 if (converted != 0) l.tokenPaid = tokenDue;
             } else {
-                fee = legEth; // bounded by the leg's output; the rest carries forward
+                fee = cap; // bounded by the cap on this leg's own output; the rest carries forward
                 uint256 ethPart = fee < ethShort ? fee : ethShort;
                 l.ethPaid += ethPart;
                 uint256 rest = fee - ethPart;
@@ -351,14 +373,20 @@ contract IMDOFeeHook {
         } else {
             // ETH shortfall priced in IMDO at this leg's rate (legSold per legEth).
             uint256 converted = (ethShort != 0 && legEth != 0) ? _ceilDiv(ethShort * legSold, legEth) : 0;
-            fee = tokenShort + converted;
-            l.tokenPaid = tokenDue;
-            if (converted != 0) l.ethPaid = ethDue;
-            // Unreachable with a 1,000,000 IMDO supply; keeps the return delta well formed.
-            if (fee > uint256(uint128(type(int128).max))) fee = uint256(uint128(type(int128).max));
+            uint256 want = tokenShort + converted;
+            uint256 cap = _ceilPpm(legSold, MAX_FEE_PPM);
+            if (want <= cap) {
+                fee = want;
+                l.tokenPaid = tokenDue;
+                if (converted != 0) l.ethPaid = ethDue;
+            } else {
+                fee = cap; // bounded by the cap on this leg's own input; the rest carries forward
+                uint256 tokenPart = fee < tokenShort ? fee : tokenShort;
+                l.tokenPaid += tokenPart;
+                uint256 rest = fee - tokenPart;
+                if (rest != 0) l.ethPaid += rest * legEth / legSold;
+            }
         }
-        _storeLedger(base, l);
-        cumulative = l.sold;
     }
 
     function _ceilPpm(uint256 basis, uint24 rate) private pure returns (uint256) {
@@ -369,7 +397,7 @@ contract IMDOFeeHook {
         return a == 0 ? 0 : (a - 1) / b + 1;
     }
 
-    /// @notice Bracket for `sold` IMDO against the previous block's reserve snapshot.
+    /// @notice Bracket for `sold` IMDO against `reserve` (see afterSwap for the sizing reserve).
     /// @dev Exact boundaries are compared by cross multiplication, without a truncated
     ///      bps intermediate. No snapshot (reserve == 0) bills at the cap.
     function feePpm(uint256 sold, uint256 reserve) public pure returns (uint24) {
