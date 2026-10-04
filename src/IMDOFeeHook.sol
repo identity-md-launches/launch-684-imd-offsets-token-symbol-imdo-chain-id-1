@@ -6,7 +6,7 @@ contract IMDOToken {
     string public constant name = "IMD Offsets";
     string public constant symbol = "IMDO";
     uint8 public constant decimals = 18;
-    uint256 public constant INITIAL_SUPPLY = 1_000_000 ether;
+    uint256 public constant INITIAL_SUPPLY = 1_000_000_000 ether;
     uint256 public totalSupply = INITIAL_SUPPLY;
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;

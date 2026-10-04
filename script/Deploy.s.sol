@@ -135,7 +135,8 @@ contract Deploy {
         require(hook.initialized(), "factory did not initialize attached pool");
         _checkBoundPool(hook, manager);
         require(
-            launchToken.totalSupply() == 1_000_000 ether && launchToken.decimals() == 18, "wrong token supply/decimals"
+            launchToken.totalSupply() == 1_000_000_000 ether && launchToken.decimals() == 18,
+            "wrong token supply/decimals"
         );
         emit LaunchVerified(tokenAddress, hookAddress, hook.poolId(), tokenAddress.codehash, hookAddress.codehash);
     }
