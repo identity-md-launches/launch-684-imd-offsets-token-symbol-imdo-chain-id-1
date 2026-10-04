@@ -137,6 +137,18 @@ contract IMDOFeeHook {
     uint256 public pendingETH;
     uint256 public pendingToken;
 
+    /// @notice One tx.origin's sells in the current transaction (transient; gone at tx end).
+    /// @dev Invariant after every leg: ethPaid <= ceil(ethBasis * rate / PPM) and
+    ///      tokenPaid <= ceil(tokenBasis * rate / PPM), where rate is the bracket of `sold`.
+    ///      The difference is the shortfall still owed and collected on the next leg.
+    struct Ledger {
+        uint256 sold; // IMDO actually paid into the pool, all legs
+        uint256 ethBasis; // gross ETH output of exact-input legs (fee basis in ETH)
+        uint256 tokenBasis; // IMDO input of exact-output legs (fee basis in IMDO)
+        uint256 ethPaid; // ETH fee collected so far (sent to TREASURY or claimed)
+        uint256 tokenPaid; // IMDO fee collected so far (burned or claimed)
+    }
+
     bytes32 private constant SOLD_NAMESPACE = keccak256("IMDO.sold.by.origin");
     bytes32 private constant PROTOCOL_SLOT = keccak256("IMDO.protocol.before.swap");
     bytes32 private constant ENTERED_SLOT = keccak256("IMDO.external.payment.guard");
@@ -253,15 +265,11 @@ contract IMDOFeeHook {
         // requested amountSpecified (which denotes ETH for an exact-output sell).
         if (tokenDelta >= 0) return (this.afterSwap.selector, 0);
         uint256 sold = uint256(-int256(tokenDelta));
-        bytes32 slot = keccak256(abi.encode(SOLD_NAMESPACE, tx.origin));
-        uint256 cumulative = _load(slot) + sold;
-        _store(slot, cumulative); // tx.origin groups volume; it grants NO authority.
-        uint24 rate = feePpm(cumulative, laggedTokenReserve);
+        int128 ethDelta = _amount0(delta);
+        uint256 legEth = ethDelta > 0 ? uint256(uint128(ethDelta)) : 0;
         bool exactInput = params.amountSpecified < 0;
-        uint256 basis = exactInput ? uint256(int256(_amount0(delta))) : sold;
-        // Rate cap is unconditional; ceil is the BaseHookFee rounding convention.
-        assert(rate <= MAX_FEE_PPM);
-        uint256 fee = (basis * rate + PPM - 1) / PPM;
+        // tx.origin groups volume for cumulative billing; it grants NO authority.
+        (uint24 rate, uint256 fee, uint256 cumulative) = _bill(tx.origin, exactInput, sold, legEth);
         if (fee == 0) return (this.afterSwap.selector, 0);
 
         bool claimed;
@@ -298,9 +306,72 @@ contract IMDOFeeHook {
         return this.afterDonate.selector;
     }
 
-    /// @notice Current leg's bracket, based on all IMDO sold by the origin this tx.
-    /// @dev No retrospective repricing of completed legs. Exact boundaries are
-    ///      compared by cross multiplication, without a truncated bps intermediate.
+    /// @dev Cumulative billing. The fee owed by an origin is always the schedule applied
+    ///      to EVERYTHING it sold this transaction: ceil(basis * rate(sold) / PPM) per side.
+    ///      Each leg collects the current shortfall (owed minus already paid), so earlier
+    ///      legs are repriced when a later leg lifts the bracket. A leg can only charge
+    ///      its unspecified currency: ETH on exact-input legs, IMDO on exact-output legs.
+    ///      The other side's shortfall is converted at this leg's own realized price.
+    ///      An exact-input leg can never charge more than its gross ETH output (the
+    ///      swapper's ETH credit must stay nonnegative so routers settle normally); any
+    ///      remainder carries to the origin's next sell in the same transaction.
+    function _bill(address origin, bool exactInput, uint256 legSold, uint256 legEth)
+        private
+        returns (uint24 rate, uint256 fee, uint256 cumulative)
+    {
+        bytes32 base = keccak256(abi.encode(SOLD_NAMESPACE, origin));
+        Ledger memory l = _loadLedger(base);
+        l.sold += legSold;
+        if (exactInput) l.ethBasis += legEth;
+        else l.tokenBasis += legSold;
+
+        rate = feePpm(l.sold, laggedTokenReserve);
+        // Rate cap is unconditional; ceil is the BaseHookFee rounding convention.
+        assert(rate <= MAX_FEE_PPM);
+        uint256 ethDue = _ceilPpm(l.ethBasis, rate);
+        uint256 tokenDue = _ceilPpm(l.tokenBasis, rate);
+        uint256 ethShort = ethDue > l.ethPaid ? ethDue - l.ethPaid : 0;
+        uint256 tokenShort = tokenDue > l.tokenPaid ? tokenDue - l.tokenPaid : 0;
+
+        if (exactInput) {
+            // IMDO shortfall priced in ETH at this leg's rate (legEth per legSold).
+            uint256 converted = (tokenShort != 0 && legEth != 0) ? _ceilDiv(tokenShort * legEth, legSold) : 0;
+            uint256 want = ethShort + converted;
+            if (want <= legEth) {
+                fee = want;
+                l.ethPaid = ethDue;
+                if (converted != 0) l.tokenPaid = tokenDue;
+            } else {
+                fee = legEth; // bounded by the leg's output; the rest carries forward
+                uint256 ethPart = fee < ethShort ? fee : ethShort;
+                l.ethPaid += ethPart;
+                uint256 rest = fee - ethPart;
+                if (rest != 0) l.tokenPaid += rest * legSold / legEth;
+            }
+        } else {
+            // ETH shortfall priced in IMDO at this leg's rate (legSold per legEth).
+            uint256 converted = (ethShort != 0 && legEth != 0) ? _ceilDiv(ethShort * legSold, legEth) : 0;
+            fee = tokenShort + converted;
+            l.tokenPaid = tokenDue;
+            if (converted != 0) l.ethPaid = ethDue;
+            // Unreachable with a 1,000,000 IMDO supply; keeps the return delta well formed.
+            if (fee > uint256(uint128(type(int128).max))) fee = uint256(uint128(type(int128).max));
+        }
+        _storeLedger(base, l);
+        cumulative = l.sold;
+    }
+
+    function _ceilPpm(uint256 basis, uint24 rate) private pure returns (uint256) {
+        return (basis * rate + PPM - 1) / PPM;
+    }
+
+    function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) {
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /// @notice Bracket for `sold` IMDO against the previous block's reserve snapshot.
+    /// @dev Exact boundaries are compared by cross multiplication, without a truncated
+    ///      bps intermediate. No snapshot (reserve == 0) bills at the cap.
     function feePpm(uint256 sold, uint256 reserve) public pure returns (uint24) {
         if (sold == 0) return 0;
         if (reserve == 0) return MAX_FEE_PPM;
@@ -315,8 +386,14 @@ contract IMDOFeeHook {
         return (reserve / 100) * percent + ((reserve % 100) * percent + 99) / 100;
     }
 
+    /// @notice IMDO sold by `origin` so far in the current transaction.
     function cumulativeSold(address origin) external view returns (uint256) {
         return _load(keccak256(abi.encode(SOLD_NAMESPACE, origin)));
+    }
+
+    /// @notice Full per-origin billing ledger for the current transaction.
+    function originLedger(address origin) external view returns (Ledger memory) {
+        return _loadLedger(keccak256(abi.encode(SOLD_NAMESPACE, origin)));
     }
 
     /// @notice Permissionless redemption of this hook's already accrued fee claims.
@@ -388,6 +465,22 @@ contract IMDOFeeHook {
 
     function _amount1(BalanceDelta delta) private pure returns (int128) {
         return int128(BalanceDelta.unwrap(delta));
+    }
+
+    function _loadLedger(bytes32 base) private view returns (Ledger memory l) {
+        l.sold = _load(base);
+        l.ethBasis = _load(bytes32(uint256(base) + 1));
+        l.tokenBasis = _load(bytes32(uint256(base) + 2));
+        l.ethPaid = _load(bytes32(uint256(base) + 3));
+        l.tokenPaid = _load(bytes32(uint256(base) + 4));
+    }
+
+    function _storeLedger(bytes32 base, Ledger memory l) private {
+        _store(base, l.sold);
+        _store(bytes32(uint256(base) + 1), l.ethBasis);
+        _store(bytes32(uint256(base) + 2), l.tokenBasis);
+        _store(bytes32(uint256(base) + 3), l.ethPaid);
+        _store(bytes32(uint256(base) + 4), l.tokenPaid);
     }
 
     function _load(bytes32 slot) private view returns (uint256 value) {

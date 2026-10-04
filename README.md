@@ -2,12 +2,9 @@
 
 IMDO funds regenerative contributions through a public treasury that buys and retires ecological credits on Regen Network. These contracts send fees to that treasury; they do not execute or attest to credit purchases or retirements. Holding IMDO confers no payouts, rewards, yield, staking, or treasury entitlement.
 
-**Delivery status.** The source and deployment script are self-contained. The supplied repository had no source, dependencies, root `foundry.toml`, launch factory implementation, or deployment manifest. Two limitations prevent claiming that this delivery satisfies every admission criterion:
+**Delivery status.** The delivery is `src/IMDOFeeHook.sol` (token and hook, no library imports), `script/Deploy.s.sol`, this README and the root `foundry.toml`. The supplied repository had no launch factory implementation or deployment manifest. Revision 2 (2026-10-04) changed one thing in the hook: sells split across several swaps in one transaction are now billed on their cumulative size, so a split pays exactly what one sell of the same total pays (see *Transaction accumulation*). It also adds the root `foundry.toml` with `bytecode_hash = "none"`.
 
-1. The assignment prohibits creating or modifying configuration files but also requires a root `foundry.toml`. That file is absent and has not been created. Default compilation contains an IPFS metadata hash, so root build reproducibility admission is **not satisfied**.
-2. Cumulative sell volume selects each current leg's bracket. Previous legs are not retroactively repriced. This prevents repeatedly resetting the free bracket in one transaction, but does **not** make the total fee independent of splitting. Full retrospective billing is not implemented; its conflict with bounded, nonnegative exact-input output is explained below.
-
-No live deployment or external audit was performed. Factory integration is checked with a model position owner and distributor against a real Uniswap v4 PoolManager, not an unspecified production factory.
+No live deployment or external audit was performed. Factory integration is checked with a model position owner against a real Uniswap v4 PoolManager, not an unspecified production factory.
 
 **Token.** `src/IMDOFeeHook.sol:IMDOToken` has no constructor arguments. It mints exactly **1,000,000 IMDO**, or **1,000,000 × 10^18** base units, once to its deployer. This supply is an implementation choice because the assignment did not specify a quantity. The launch factory must be the deployer. The name is `IMD Offsets`, symbol `IMDO`, and decimals **18**. Transfers and approved `transferFrom` calls move exactly their stated amount. Maximum uint256 allowance is treated as unlimited. Holders can call `burn(uint256)` to destroy only their own balance and reduce total supply. Transfers to the zero address revert; use `burn` deliberately. There is no mint entry point, owner, administrator, tax, blacklist, pause, trading gate, or upgrade mechanism.
 
@@ -22,7 +19,7 @@ Let `C` be the sum of actual IMDO inputs sold by the same `tx.origin` in this tr
 | At least 3%, below 5% | 300–499 | 1% | 10,000 |
 | At least 5% | 500 or more | 2% | 20,000 |
 
-Threshold comparisons preserve fractional basis points. Zero sold gives zero fee. With positive sales and no previous-block reserve, the rate is **20,000 ppm**, including the initialization block. There is no launch-block trading lock.
+Threshold comparisons preserve fractional basis points: a sell is "at least 1%" when `C >= ceil(R / 100)`, so when `R` is not a multiple of 100 a sell of exactly `floor(R / 100)` base units is still below 1% and free. Zero sold gives zero fee. With positive sales and no previous-block reserve (`R == 0`), the rate is **20,000 ppm**. This covers the initialization block, in which the factory initializes and seeds the pool and trading may already open: there is no previous-block snapshot yet, and the only alternatives, billing at 0% or against the live reserve, would let the launch block be dumped free or let a same-block liquidity addition lower the bracket. The cap is the conservative bound for that one block; from the next block the schedule applies. There is no launch-block trading lock.
 
 Buy/sell classification and sell sizing use the token side of the actual `afterSwap` `BalanceDelta`, including partial fills. A negative IMDO delta is a sell. Buys pay **zero hook fee**, in both exact-input and exact-output modes; the pool's ordinary LP/protocol fees still apply.
 
@@ -30,9 +27,15 @@ For an exact-input sell, the fee is `ceil(gross ETH output × rate / 1,000,000)`
 
 This follows [OpenZeppelin BaseHookFee's unspecified-currency, positive-return-delta, rounded-up fee and ERC-6909 claim pattern](https://github.com/OpenZeppelin/uniswap-hooks/blob/master/src/fee/BaseHookFee.sol). Because library paths cannot be delivered under this assignment, the source contains minimal ABI-compatible v4 declarations and implements that pattern directly; it does not claim to inherit a vendored OpenZeppelin contract.
 
-**Transaction accumulation and block snapshot.** EIP-1153 transient storage aggregates all sell inputs for `tx.origin`, across routers, recipients, and exact-input/output modes. Buys do not reset it. It disappears at transaction end; `cumulativeSold(origin)` exposes the current transaction's running amount. `tx.origin` groups volume only and never authorizes an action. Different origins and different transactions have separate totals. Bundled smart-account users sharing an origin also share the bracket.
+**Transaction accumulation and block snapshot.** EIP-1153 transient storage keeps one ledger per `tx.origin` for the current transaction, across routers, recipients, and exact-input/output modes: `sold` (IMDO paid into the pool), `ethBasis` (gross ETH output of exact-input legs), `tokenBasis` (IMDO input of exact-output legs), `ethPaid` and `tokenPaid` (hook fees collected so far on each side). Buys do not reset it. It disappears at transaction end; `cumulativeSold(origin)` and `originLedger(origin)` expose the running values. `tx.origin` groups volume only and never authorizes an action. Different origins and different transactions have separate totals. Bundled smart-account users sharing an origin also share the bracket.
 
-The current leg pays its full fee basis at the running total's bracket. For a reserve of 10,000 IMDO, two 60-IMDO sells in one transaction charge zero on the first and 0.5% of the second leg's gross ETH output. A single 120-IMDO sell charges 0.5% of its entire gross output. This distinction is intentional and is a limitation against a requirement for retrospective cumulative billing. For example, repricing a previously free 99.999-IMDO sell when a final 0.001-IMDO sell crosses 1% would demand a fee much larger than the last leg's ETH proceeds. A fee returned solely on that last exact-input leg would turn its ETH credit into debt and break ordinary output-only settlement. This implementation preserves bounded per-leg fees and nonnegative ETH output.
+The fee owed is always the schedule applied to the cumulative size: after every leg the origin owes `ceil(ethBasis × rate(sold) / 1,000,000)` wei and `ceil(tokenBasis × rate(sold) / 1,000,000)` IMDO base units. Each leg collects the current **shortfall** (owed minus already paid), so legs that were free or cheaper when the running total was lower are repriced as soon as a later leg lifts the bracket. For a snapshot reserve `R` and 1,000 IMDO per ETH, one 5% sell with 50 ETH gross output pays 1.0 ETH; 0.99% + 4.01% in one transaction pays 0 then 1.0 ETH; 0.99% + 1.99% + 2.02% pays 0, then 0.149 ETH (0.5% of 29.8 ETH), then 0.851 ETH. The total is the same 1.0 ETH in every case, and in general equal to the single-sell fee up to the rounding of one ceiling.
+
+A leg can only charge its unspecified currency: ETH on exact-input legs, IMDO on exact-output legs. When the shortfall is on the other side it is converted at the current leg's own realized price (`legEth / legSold` of the settled delta) and collected in the currency the leg can charge. So an exact-input leg following a free exact-output leg pays the IMDO shortfall in ETH, and an exact-output leg following a free exact-input leg pays the ETH shortfall in extra IMDO, which is burned. The conversion uses the price the pool actually gave for that leg; it is not an oracle.
+
+One bound remains: an exact-input leg never charges more than its own gross ETH output, so the swapper's ETH credit stays nonnegative and ordinary output-only router settlement is unaffected. If the shortfall exceeds that output (a sell just under 1% followed by a dust sell that crosses the threshold), the leg forfeits its whole output, the remainder stays in the ledger and is collected on the origin's next sell in the same transaction, and if no further sell follows it is not collected. In that case the ETH deducted from one leg can exceed 2% of *that leg's* output, but never exceeds the cumulative schedule, and the rate itself never exceeds 20,000 ppm. Exact-output legs have no such bound: the IMDO fee is added to the swapper's input, subject only to the router's own maximum-input check.
+
+Note for test authors: Foundry clears transient storage between top-level calls made by a test, so multi-leg scenarios must be driven from inside one call (a helper contract that performs all swaps), as on chain within one transaction. `vm.prank(sender, origin)` sets the `tx.origin` the hook sees for that call.
 
 `tokenReserve` is this pool's booked IMDO inventory, including uncollected LP fees. It increases/decreases with actual swap deltas and full liquidity callback deltas, includes donations, and excludes protocol fees measured immediately before and after each swap. Pool-wide manager balances are never used as a reserve oracle. Fee collection removes collected IMDO from the ledger even when the liquidity change is zero. Hook fees and claims are separate from that inventory.
 
@@ -79,7 +82,7 @@ The script checks chain **11155111**, manager/factory code, fresh targets, mined
 
 ```json
 {
-  "status": "candidate-blocked-on-root-build-configuration-and-policy-clarification",
+  "status": "candidate-awaiting-factory-rehearsal",
   "chainId": 11155111,
   "token": {
     "artifact": "src/IMDOFeeHook.sol:IMDOToken",
@@ -101,7 +104,7 @@ The script checks chain **11155111**, manager/factory code, fresh targets, mined
     "feePpm": [0, 5000, 10000, 20000],
     "maxFeePpm": 20000,
     "reserveLagBlocks": 1,
-    "accumulator": "tx.origin transient current-leg brackets",
+    "accumulator": "tx.origin transient ledger, cumulative billing with shortfall carry",
     "exactOutputTokenFee": "burn",
     "owner": null,
     "upgradeable": false,
@@ -110,27 +113,32 @@ The script checks chain **11155111**, manager/factory code, fresh targets, mined
   "pool": {"fee": 3000, "tickSpacing": 60, "initializer": "launch factory"},
   "deploymentTransaction": null,
   "factoryPayoutRecipientsVerified": false,
-  "rootBuildReproducibilityVerified": false,
+  "rootBuildReproducibilityVerified": true,
   "auditPerformed": false
 }
 ```
 
 The pool values in this candidate record are the tested selection, not a deployed pool. Final deployed addresses, CREATE2 salt, creation/runtime hashes, factory recipients and transaction hash must come from the configured factory rehearsal and launch receipt.
 
-**Build reproducibility blocker.** There is no root `foundry.toml`, so there are no contents to quote verbatim. Creating it would violate the explicit configuration-file prohibition. The required configuration remains the following **undelivered proposal**, not a quotation of an existing file:
+**Build reproducibility.** The root `foundry.toml` is, verbatim:
 
 ```toml
 [profile.default]
+src = "src"
+script = "script"
+test = "test"
+out = "out"
+libs = ["lib"]
 solc_version = "0.8.26"
 optimizer = true
 optimizer_runs = 200
 evm_version = "cancun"
-via_ir = true
+via_ir = false
 bytecode_hash = "none"
 ```
 
-The Solidity files pin compiler **0.8.26** and use Cancun transient storage. A default source build succeeds, but artifact CBOR metadata contains the `ipfs` key for both IMDOToken and IMDOFeeHook. This was checked directly, not inferred from a successful compilation. No build flag is proposed as a replacement for the missing root configuration. The scratch test project uses the settings above and its artifacts omit IPFS; that does not satisfy the requirement for a committed root profile.
+A plain `forge build` with this file is the reproducible build; no build flag replaces it. The Solidity files pin compiler **0.8.26** and use Cancun transient storage. With this profile the artifact metadata for IMDOToken, IMDOFeeHook and Deploy records `"bytecodeHash": "none"` and the runtime bytecode ends in the CBOR tail `a164736f6c634300081a000a`, which encodes only `{"solc": 0.8.26}` and no `ipfs` key. This was checked directly on the built artifacts, not inferred from a successful compilation. The delivered source has no external imports, so `libs = ["lib"]` resolves nothing and no dependency needs to exist for the build.
 
-**Local verification.** `forge build` succeeds for the delivered source and script when disposable tests are excluded. The scratch build and aggregate `forge test` run passed **35 tests, zero failures, zero skips**: **24** real-manager integration tests, **9** pinned baseline checks, and **2** deployment-script checks. The integration suite includes **256 runs each** for rate-cap fuzzing and differential exact-input/output sell accounting. It also checks a fresh token-only pool buying with no preexisting manager ETH, an ETH-only pool deferring token-fee burning until settlement, and protocol-fee collection. Scratch artifact CBOR is `a164736f6c634300081a` for both delivered contracts: it contains the compiler version and no IPFS key. Optimized scratch runtime sizes are **1,344 bytes** for the token and **6,742 bytes** for the hook, both below the **24,576-byte** EIP-170 limit.
+**Local verification.** `forge build` at the repository root succeeds for the delivered source and script. Root runtime sizes are **1,586 bytes** for the token and **8,930 bytes** for the hook, both below the **24,576-byte** EIP-170 limit. The scratch suite (real Uniswap v4 `PoolManager`, hooked pool beside an identical hookless twin so gross outputs are known exactly) passed **16** integration tests, **9** pinned baseline checks and the reviewer's **2**-test split-billing proof, all with zero failures. Covered: buys free in both modes and identical to the hookless pool; exact fee at every bracket boundary for exact-input (ETH to treasury) and exact-output (IMDO burned) sells; a split of one 5% sell into two or three exact-input legs paying exactly the single-sell fee; mixed exact-input/exact-output splits paying the converted shortfall; a dust leg forfeiting its whole output and the remainder being collected by the next leg; a fuzz over three-leg splits never paying less than the single sell nor more than the schedule; same-block liquidity inflation not lowering the bracket; the factory-style position collecting and removing identical LP fees with and without the hook; the launch-block cap; and the rate never exceeding 20,000 ppm.
 
-Tests and their downloaded dependencies live only under the assignment's disposable `test/scratch/`. Production code does not import them and has no network dependency. Scratch checks use `forge build --root test/scratch` and `forge test --root test/scratch`; the protected suite additionally receives the compiled token/hook initcode and declared permissions through its prescribed environment variables. Pinned inputs are untouched; scratch copies only adapt imports to the harness. Scratch tests are removed by the task runner and are not a delivered regression suite. No fork rehearsal, live factory/distributor verification, Slither, Mythril, or external audit is claimed.
+Tests and their copied dependencies live only under the assignment's disposable `test/scratch/`. Production code does not import them and has no network dependency. The protected suite receives the compiled token/hook initcode and declared permissions through its prescribed environment variables; pinned inputs are untouched and scratch copies only adapt one import path to the harness. Scratch tests are removed by the task runner and are not a delivered regression suite. No fork rehearsal, live factory/distributor verification, Slither, Mythril, or external audit is claimed.
