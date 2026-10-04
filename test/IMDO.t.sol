@@ -5093,6 +5093,23 @@ abstract contract Asserts {
         return (basis * ppm + PPM - 1) / PPM;
     }
 
+    function _ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a == 0 ? 0 : (a - 1) / b + 1;
+    }
+
+    /// @dev |a - b| <= tolerance, with the values in the message.
+    function assertClose(uint256 a, uint256 b, uint256 tolerance, string memory why) internal pure {
+        uint256 diff = a > b ? a - b : b - a;
+        if (diff > tolerance) revert(string.concat(why, " [", _str(a), " vs ", _str(b), "]"));
+    }
+
+    function _same(uint256 size, uint256 n) internal pure returns (uint256[] memory sizes) {
+        sizes = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            sizes[i] = size;
+        }
+    }
+
     function _str(uint256 v) internal pure returns (string memory) {
         if (v == 0) return "0";
         uint256 len;
@@ -5597,6 +5614,7 @@ contract IMDOHookTest is V4Fixture {
 
     Universe U; // launch pool with the hook
     Universe T; // identical pool, no hook (control)
+    Universe V; // a second hooked copy, built on demand, for single-sell versus split comparisons
 
     address feeRecipientU = address(0xFEE1);
     address feeRecipientT = address(0xFEE2);
@@ -6052,33 +6070,130 @@ contract IMDOHookTest is V4Fixture {
         _done();
     }
 
-    /// @dev One exact-input leg followed by one exact-output leg, same transaction.
+    /// @dev Arbitrary exact-input legs by `user` in one transaction. Returns, per leg, the hook fee that reached the
+    ///      treasury, the gross ETH output (control pool) and the net ETH the user received, plus the hook's
+    ///      per-origin ledger as it stands at the end of the transaction.
+    function runLegsExactIn(address user, uint256[] memory sizes)
+        external
+        returns (uint256[] memory fees, uint256[] memory gross, uint256[] memory net, IMDOFeeHook.Ledger memory ledger)
+    {
+        require(msg.sender == address(this));
+        uint256 n = sizes.length;
+        fees = new uint256[](n);
+        gross = new uint256[](n);
+        net = new uint256[](n);
+        _as(user);
+        for (uint256 i = 0; i < n; i++) {
+            gross[i] = uint256(uint128(_sellExactIn(T, user, sizes[i]).amount0()));
+        }
+        for (uint256 i = 0; i < n; i++) {
+            uint256 before = TREASURY.balance;
+            uint256 ethBefore = user.balance;
+            _sellExactIn(U, user, sizes[i]);
+            fees[i] = TREASURY.balance - before;
+            net[i] = user.balance - ethBefore;
+        }
+        ledger = U.hook.originLedger(user);
+        _done();
+    }
+
+    /// @dev One exact-input leg followed by one exact-output leg, same transaction. Returns the first leg's gross
+    ///      ETH output, the second leg's token fee (burned) and token input, and the ledger at the end.
     function runSplitMixed(address user, uint256 leg, uint256 ethLeg)
         external
-        returns (uint256 tokenFee2, uint256 sold2, uint256 cumulative)
+        returns (uint256 gross1, uint256 tokenFee2, uint256 sold2, IMDOFeeHook.Ledger memory ledger)
     {
         require(msg.sender == address(this));
         _as(user);
-        _sellExactIn(T, user, leg);
+        gross1 = uint256(uint128(_sellExactIn(T, user, leg).amount0()));
         sold2 = uint256(uint128(-_sellExactOut(T, user, ethLeg).amount1()));
         _sellExactIn(U, user, leg);
         uint256 supplyBefore = U.token.totalSupply();
         BalanceDelta u2 = _sellExactOut(U, user, ethLeg);
         tokenFee2 = uint256(uint128(-u2.amount1())) - sold2;
         assertEq(supplyBefore - U.token.totalSupply(), tokenFee2, "token fee burned");
-        cumulative = U.hook.cumulativeSold(user);
+        assertEq(int256(u2.amount0()), int256(ethLeg), "exact-out leg still delivers exactly the requested ETH");
+        ledger = U.hook.originLedger(user);
         _done();
     }
 
-    function test_splitSells_sameTx_secondLegBilledAtCumulativeBracket() public {
+    /// @dev One exact-output leg followed by one exact-input leg, same transaction.
+    function runSplitMixedReverse(address user, uint256 ethLeg, uint256 leg)
+        external
+        returns (uint256 sold1, uint256 gross2, uint256 ethFee2, uint256 burned, IMDOFeeHook.Ledger memory ledger)
+    {
+        require(msg.sender == address(this));
+        _as(user);
+        sold1 = uint256(uint128(-_sellExactOut(T, user, ethLeg).amount1()));
+        gross2 = uint256(uint128(_sellExactIn(T, user, leg).amount0()));
+        uint256 supplyBefore = U.token.totalSupply();
+        uint256 treasuryBefore = TREASURY.balance;
+        _sellExactOut(U, user, ethLeg);
+        assertEq(TREASURY.balance, treasuryBefore, "free exact-out leg pays no ETH");
+        _sellExactIn(U, user, leg);
+        ethFee2 = TREASURY.balance - treasuryBefore;
+        burned = supplyBefore - U.token.totalSupply();
+        ledger = U.hook.originLedger(user);
+        _done();
+    }
+
+    /// @dev Two exact-output legs, same transaction. Returns per-leg token input (control) and token fee (burned).
+    function runSplitExactOut(address user, uint256 ethLeg)
+        external
+        returns (uint256[2] memory sold, uint256[2] memory tokenFee, IMDOFeeHook.Ledger memory ledger)
+    {
+        require(msg.sender == address(this));
+        _as(user);
+        for (uint256 i = 0; i < 2; i++) {
+            sold[i] = uint256(uint128(-_sellExactOut(T, user, ethLeg).amount1()));
+        }
+        for (uint256 i = 0; i < 2; i++) {
+            uint256 supplyBefore = U.token.totalSupply();
+            BalanceDelta d = _sellExactOut(U, user, ethLeg);
+            tokenFee[i] = uint256(uint128(-d.amount1())) - sold[i];
+            assertEq(supplyBefore - U.token.totalSupply(), tokenFee[i], "token fee burned");
+        }
+        ledger = U.hook.originLedger(user);
+        _done();
+    }
+
+    /// @dev Two different origins each sell `leg` inside the same transaction (a bundle).
+    function runTwoOriginsSameTx(address a, address b, uint256 leg)
+        external
+        returns (uint256 feeA, uint256 feeB, uint256 soldA, uint256 soldB)
+    {
+        require(msg.sender == address(this));
+        uint256 before = TREASURY.balance;
+        _as(a);
+        _sellExactIn(U, a, leg);
+        _done();
+        feeA = TREASURY.balance - before;
+        before = TREASURY.balance;
+        _as(b);
+        _sellExactIn(U, b, leg);
+        _done();
+        feeB = TREASURY.balance - before;
+        soldA = U.hook.cumulativeSold(a);
+        soldB = U.hook.cumulativeSold(b);
+    }
+
+    function test_splitSells_sameTx_secondLegRepricesTheFirst() public {
         uint256 leg = R * 6 / 1000; // 0.6% each; two legs cross 1%
-        (uint256[] memory fees, uint256[] memory gross, uint256 cumulative) = this.runSplitExactIn(alice, leg, 2);
+        (uint256[] memory fees, uint256[] memory gross, uint256[] memory net, IMDOFeeHook.Ledger memory l) =
+            this.runLegsExactIn(alice, _same(leg, 2));
         assertEq(fees[0], 0, "first 0.6% leg is under 1%: free");
-        assertEq(cumulative, 2 * leg, "legs accumulate per origin within the tx");
-        assertGt(fees[1], 0, "second leg must be billed: cumulative 1.2% is in the 0.5% bracket");
-        assertGe(fees[1], _ceilFee(gross[1], 5_000), "second leg billed at least at the cumulative bracket");
-        assertLe(fees[1], _ceilFee(gross[0] + gross[1], 20_000), "never above the cap on everything sold");
+        assertEq(net[0], gross[0], "first leg paid out in full");
+        // cumulative 1.2% is in the 0.5% bracket: the second leg pays 0.5% of BOTH legs' gross output
+        assertEq(fees[1], _ceilFee(gross[0] + gross[1], 5_000), "second leg bills the cumulative size");
+        assertGt(fees[1], _ceilFee(gross[1], 5_000), "which is more than 0.5% of the second leg alone");
+        assertEq(net[1], gross[1] - fees[1], "second leg paid out gross minus the fee");
+        assertEq(l.sold, 2 * leg, "ledger: everything sold");
+        assertEq(l.ethBasis, gross[0] + gross[1], "ledger: gross ETH of both exact-input legs");
+        assertEq(l.ethPaid, fees[1], "ledger: ETH collected");
+        assertEq(l.tokenBasis + l.tokenPaid, 0, "ledger: no token side on exact-input legs");
         assertEq(U.hook.cumulativeSold(alice), 0, "counter is transient: gone once the transaction ends");
+        IMDOFeeHook.Ledger memory gone = U.hook.originLedger(alice);
+        assertEq(gone.sold + gone.ethBasis + gone.tokenBasis + gone.ethPaid + gone.tokenPaid, 0, "ledger gone");
 
         // a different origin selling the same 0.6% in its own transaction is free
         uint256 before = TREASURY.balance;
@@ -6088,29 +6203,212 @@ contract IMDOHookTest is V4Fixture {
 
     function test_splitSells_threeSmallLegsCannotStayFree() public {
         uint256 leg = R * 4 / 1000; // 0.4% each; third leg crosses 1%
-        (uint256[] memory fees, uint256[] memory gross,) = this.runSplitExactIn(carol, leg, 3);
+        (uint256[] memory fees, uint256[] memory gross,,) = this.runLegsExactIn(carol, _same(leg, 3));
         assertEq(fees[0] + fees[1], 0, "0.8% cumulative is still free");
-        assertGe(fees[2], _ceilFee(gross[2], 5_000), "third leg (1.2% cumulative) is billed");
+        assertEq(fees[2], _ceilFee(gross[0] + gross[1] + gross[2], 5_000), "third leg bills all three at 0.5%");
     }
 
     function test_splitSells_manyLegsEscalateThroughEveryBracket() public {
         uint256 leg = R * 8 / 1000; // 0.8% each: cumulative 0.8, 1.6, 2.4, 3.2, 4.0, 4.8, 5.6 %
-        (uint256[] memory fees, uint256[] memory gross,) = this.runSplitExactIn(alice, leg, 7);
-        uint256[7] memory floorPpm = [uint256(0), 5_000, 5_000, 10_000, 10_000, 10_000, 20_000];
+        (uint256[] memory fees, uint256[] memory gross, uint256[] memory net, IMDOFeeHook.Ledger memory l) =
+            this.runLegsExactIn(alice, _same(leg, 7));
+        uint256[7] memory ppm = [uint256(0), 5_000, 5_000, 10_000, 10_000, 10_000, 20_000];
+        uint256 paid;
+        uint256 sumGross;
         for (uint256 i = 0; i < 7; i++) {
             string memory tag = string.concat("leg #", _str(i));
-            assertGe(fees[i], _ceilFee(gross[i], floorPpm[i]), string.concat(tag, ": at least the cumulative bracket"));
-            assertLe(fees[i], _ceilFee(gross[i] * (i + 1), 20_000), string.concat(tag, ": never above cap on all legs"));
+            assertEq(_expectedPpm(leg * (i + 1), R), ppm[i], string.concat(tag, ": test schedule"));
+            paid += fees[i];
+            sumGross += gross[i];
+            // After every leg the origin has paid exactly the schedule on everything it sold so far.
+            assertEq(paid, _ceilFee(sumGross, ppm[i]), string.concat(tag, ": cumulative fee == schedule(cumulative)"));
+            assertEq(net[i], gross[i] - fees[i], string.concat(tag, ": user receives gross minus this leg's fee"));
+            assertLe(fees[i], _ceilFee(sumGross, 20_000), string.concat(tag, ": never above the cap on all legs"));
         }
         assertEq(fees[0], 0, "only the first 0.8% is free");
+        // legs that lift the bracket (#1 to 0.5%, #3 to 1%, #6 to 2%) also reprice everything before them
+        assertGt(fees[1], _ceilFee(gross[1], 5_000), "leg #1 repriced leg #0");
+        assertGt(fees[3], _ceilFee(gross[3], 10_000), "leg #3 repriced legs #0..#2");
+        assertGt(fees[6], _ceilFee(gross[6], 20_000), "leg #6 repriced legs #0..#5");
+        // legs inside a bracket pay just their own share
+        assertEq(fees[2], _ceilFee(sumGrossUpTo(gross, 2), 5_000) - _ceilFee(sumGrossUpTo(gross, 1), 5_000), "leg #2");
+        assertEq(l.sold, 7 * leg, "ledger sold");
+        assertEq(l.ethBasis, sumGross, "ledger basis");
+        assertEq(l.ethPaid, paid, "ledger paid");
     }
 
-    function test_splitSells_exactOutLegCountsTowardsCumulative() public {
+    function sumGrossUpTo(uint256[] memory gross, uint256 last) internal pure returns (uint256 s) {
+        for (uint256 i = 0; i <= last; i++) {
+            s += gross[i];
+        }
+    }
+
+    function test_splitSells_splitPaysWhatOneSellOfTheSameTotalPays() public {
+        // A third, identical hooked universe takes the single sell, so both start from the same pool state.
+        _build(V, true, address(0xFEE3), TICK_LOWER, TICK_UPPER, SEED_ETH, SEED_TOKENS);
+        _fund(V, bob, 60_000 ether, 1_000 ether);
+        vm.roll(block.number + 1);
+        assertEq(V.hook.tokenReserve(), R, "same seed, same reserve");
+        uint256 total = _atPercent(R, 5); // one 5% sell: 2% bracket
+        uint256 treasuryBefore = TREASURY.balance;
+        BalanceDelta single = _sellExactIn(V, bob, total);
+        uint256 singleFee = TREASURY.balance - treasuryBefore;
+        uint256 singleGross = uint256(uint128(single.amount0())) + singleFee;
+        assertEq(singleFee, _ceilFee(singleGross, 20_000), "single sell pays 2% of its gross output");
+
+        // the same total as 2.5% + 2.5%, as 0.99% + 4.01%, and as five 1% legs
+        uint256[3] memory totals;
+        uint256[] memory a = new uint256[](2);
+        a[0] = total / 2;
+        a[1] = total - a[0];
+        totals[0] = _runAndSum(alice, a);
+        uint256[] memory b = new uint256[](2);
+        b[0] = _atPercent(R, 1) - 1;
+        b[1] = total - b[0];
+        totals[1] = _runAndSum(carol, b);
+        uint256[] memory c = _same(total / 5, 5);
+        c[4] = total - 4 * (total / 5);
+        totals[2] = _runAndSum(dave, c);
+        for (uint256 i = 0; i < 3; i++) {
+            // identical up to the pool's own per-swap rounding (a few wei) and one ceiling
+            assertClose(totals[i], singleFee, 16, string.concat("split #", _str(i), " pays what the single sell pays"));
+        }
+    }
+
+    /// @dev Runs `sizes` as one transaction on a fresh copy of the pool state and returns the total fee paid; the
+    ///      hooked and control pools are rebuilt first so every variant starts from the same reserve and price.
+    function _runAndSum(address user, uint256[] memory sizes) internal returns (uint256 total) {
+        _build(U, true, feeRecipientU, TICK_LOWER, TICK_UPPER, SEED_ETH, SEED_TOKENS);
+        _build(T, false, feeRecipientT, TICK_LOWER, TICK_UPPER, SEED_ETH, SEED_TOKENS);
+        _fund(U, user, 60_000 ether, 1_000 ether);
+        _fund(T, user, 60_000 ether, 1_000 ether);
+        vm.roll(block.number + 1);
+        assertEq(U.hook.tokenReserve(), R, "rebuilt pool has the same reserve");
+        (uint256[] memory fees, uint256[] memory gross,, IMDOFeeHook.Ledger memory l) = this.runLegsExactIn(user, sizes);
+        uint256 sumGross;
+        for (uint256 i = 0; i < fees.length; i++) {
+            total += fees[i];
+            sumGross += gross[i];
+        }
+        assertEq(total, _ceilFee(sumGross, 20_000), "total is exactly 2% of the summed gross output");
+        assertEq(l.ethPaid, total, "ledger agrees");
+    }
+
+    function test_splitSells_exactOutLegCollectsTheEarlierExactInLegsShortfallInTokens() public {
+        uint256 leg = R * 6 / 1000; // 0.6% exact-in (free alone) ...
+        uint256 ethLeg = _tokensToEth(U, leg); // ... then ~0.6% exact-out: cumulative ~1.2% -> 0.5%
+        (uint256 gross1, uint256 tokenFee2, uint256 sold2, IMDOFeeHook.Ledger memory l) =
+            this.runSplitMixed(alice, leg, ethLeg);
+        assertEq(_expectedPpm(leg + sold2, R), 5_000, "cumulative lands in the 0.5% bracket");
+        assertEq(l.sold, leg + sold2, "exact-out input accumulates too");
+        // the exact-out leg can only charge IMDO: its own 0.5% in IMDO, plus the first leg's 0.5% of ETH converted to
+        // IMDO at this leg's own realized price (sold2 IMDO per ethLeg wei), rounded up
+        uint256 tokenDue = _ceilFee(sold2, 5_000);
+        uint256 ethDue = _ceilFee(gross1, 5_000);
+        uint256 converted = _ceilDiv(ethDue * sold2, ethLeg);
+        assertEq(tokenFee2, tokenDue + converted, "second (exact-out) leg collects both shortfalls in IMDO");
+        assertGt(converted, 0, "the conversion is live");
+        assertEq(l.tokenPaid, tokenDue, "ledger: token side settled");
+        assertEq(l.ethPaid, ethDue, "ledger: ETH side settled (in IMDO)");
+        assertEq(l.ethBasis, gross1, "ledger: ETH basis is the exact-in leg's gross output");
+        assertEq(l.tokenBasis, sold2, "ledger: token basis is the exact-out leg's input");
+        assertEq(TREASURY.balance, 0, "no ETH moved in this transaction");
+    }
+
+    function test_splitSells_exactInLegCollectsTheEarlierExactOutLegsShortfallInEth() public {
         uint256 leg = R * 6 / 1000;
-        uint256 ethLeg = _tokensToEth(U, leg);
-        (uint256 tokenFee2, uint256 sold2, uint256 cumulative) = this.runSplitMixed(alice, leg, ethLeg);
-        assertEq(cumulative, leg + sold2, "exact-out input accumulates too");
-        assertGe(tokenFee2, _ceilFee(sold2, 5_000), "second (exact-out) leg billed at the cumulative bracket");
+        uint256 ethLeg = _tokensToEth(U, leg); // ~0.6% exact-out (free alone), then 0.6% exact-in
+        (uint256 sold1, uint256 gross2, uint256 ethFee2, uint256 burned, IMDOFeeHook.Ledger memory l) =
+            this.runSplitMixedReverse(alice, ethLeg, leg);
+        assertEq(_expectedPpm(sold1 + leg, R), 5_000, "cumulative lands in the 0.5% bracket");
+        uint256 ethDue = _ceilFee(gross2, 5_000);
+        uint256 tokenDue = _ceilFee(sold1, 5_000);
+        uint256 converted = _ceilDiv(tokenDue * gross2, leg);
+        assertEq(ethFee2, ethDue + converted, "exact-in leg collects both shortfalls in ETH");
+        assertEq(burned, 0, "nothing burned: the token shortfall was paid in ETH instead");
+        assertEq(l.ethPaid, ethDue, "ledger: ETH side settled");
+        assertEq(l.tokenPaid, tokenDue, "ledger: token side settled (in ETH)");
+        assertEq(U.token.balanceOf(TREASURY), 0, "treasury gets ETH only");
+        assertLe(ethFee2, gross2, "a leg never charges more than its own output");
+    }
+
+    function test_splitSells_twoExactOutLegsBilledCumulatively() public {
+        uint256 ethLeg = _tokensToEth(U, R * 6 / 1000);
+        (uint256[2] memory sold, uint256[2] memory tokenFee, IMDOFeeHook.Ledger memory l) =
+            this.runSplitExactOut(alice, ethLeg);
+        assertEq(_expectedPpm(sold[0], R), 0, "first leg alone is free");
+        assertEq(_expectedPpm(sold[0] + sold[1], R), 5_000, "together they are in the 0.5% bracket");
+        assertEq(tokenFee[0], 0, "first exact-out leg free");
+        assertEq(tokenFee[1], _ceilFee(sold[0] + sold[1], 5_000), "second leg bills 0.5% of both legs' input");
+        assertEq(l.tokenBasis, sold[0] + sold[1], "ledger basis");
+        assertEq(l.tokenPaid, tokenFee[1], "ledger paid");
+        assertEq(l.ethBasis + l.ethPaid, 0, "no ETH side");
+    }
+
+    function test_splitSells_differentOriginsInOneTransactionAreSeparate() public {
+        uint256 leg = R * 6 / 1000; // 0.6% each: free for each origin, 1.2% if they were pooled
+        (uint256 feeA, uint256 feeB, uint256 soldA, uint256 soldB) = this.runTwoOriginsSameTx(alice, bob, leg);
+        assertEq(feeA + feeB, 0, "each origin is sized on its own volume");
+        assertEq(soldA, leg, "alice's counter");
+        assertEq(soldB, leg, "bob's counter");
+    }
+
+    function test_splitSells_dustLegForfeitsItsOutputAndTheNextLegCollectsTheRemainder() public {
+        uint256[] memory sizes = new uint256[](3);
+        sizes[0] = _atPercent(R, 1) - 1; // one wei under 1%: free alone
+        sizes[1] = 1e12; // dust that lifts the running total to 1%: owes 0.5% of ~2 ETH, outputs ~1e9 wei
+        sizes[2] = R * 6 / 1000; // 0.6%: cumulative 1.6%, still 0.5%
+        (uint256[] memory fees, uint256[] memory gross, uint256[] memory net, IMDOFeeHook.Ledger memory l) =
+            this.runLegsExactIn(alice, sizes);
+        assertEq(fees[0], 0, "prefix is free");
+        uint256 owedAfterDust = _ceilFee(gross[0] + gross[1], 5_000);
+        assertGt(owedAfterDust, gross[1], "the dust leg cannot cover what is owed");
+        assertEq(fees[1], gross[1], "dust leg forfeits its whole output, no more");
+        assertEq(net[1], 0, "user receives nothing from the dust leg");
+        uint256 owedAfterAll = _ceilFee(gross[0] + gross[1] + gross[2], 5_000);
+        assertEq(fees[2], owedAfterAll - gross[1], "next leg collects the carried remainder plus its own share");
+        assertEq(fees[0] + fees[1] + fees[2], owedAfterAll, "total is the schedule on everything sold");
+        assertEq(l.ethPaid, owedAfterAll, "ledger settled");
+    }
+
+    function test_splitSells_dustLegWithoutASuccessor_neverCheaperThanThePrefixAlone() public {
+        // Just under 3% (0.5% bracket) then dust lifting to 3% (1% bracket) with nothing after it. The dust leg
+        // cannot cover the repricing, so part of the schedule stays uncollected; what IS collected is never less
+        // than the prefix alone would pay and never more than the schedule on the total. (README: bounded leg.)
+        uint256[] memory sizes = new uint256[](2);
+        sizes[0] = _atPercent(R, 3) - 1;
+        sizes[1] = 1e12;
+        (uint256[] memory fees, uint256[] memory gross, uint256[] memory net, IMDOFeeHook.Ledger memory l) =
+            this.runLegsExactIn(alice, sizes);
+        assertEq(fees[0], _ceilFee(gross[0], 5_000), "prefix pays its own bracket");
+        assertEq(fees[1], gross[1], "dust leg forfeits its whole output");
+        assertEq(net[1], 0, "and the user receives nothing from it");
+        uint256 total = fees[0] + fees[1];
+        uint256 schedule = _ceilFee(gross[0] + gross[1], 10_000);
+        assertGe(total, _ceilFee(gross[0], 5_000), "never below the prefix alone");
+        assertLt(total, schedule, "the remainder of the 1% schedule stays uncollected without a later leg");
+        assertEq(l.ethPaid, total, "ledger records exactly what was collected");
+        assertLt(l.ethPaid, _ceilFee(l.ethBasis, 10_000), "and still shows the shortfall");
+        assertEq(U.hook.originLedger(alice).ethPaid, 0, "which disappears with the transaction");
+    }
+
+    /// forge-config: default.fuzz.runs = 32
+    function testFuzz_splitSells_threeLegsPayExactlyTheScheduleOnTheTotal(uint256 a, uint256 b, uint256 c) public {
+        // legs of at least 0.2% of the reserve: every leg's output covers the repricing it can trigger
+        uint256[] memory sizes = new uint256[](3);
+        sizes[0] = _bound(a, R / 500, R * 3 / 100);
+        sizes[1] = _bound(b, R / 500, R * 3 / 100);
+        sizes[2] = _bound(c, R / 500, R * 3 / 100);
+        (uint256[] memory fees, uint256[] memory gross,, IMDOFeeHook.Ledger memory l) =
+            this.runLegsExactIn(alice, sizes);
+        uint256 total = fees[0] + fees[1] + fees[2];
+        uint256 sumGross = gross[0] + gross[1] + gross[2];
+        uint256 ppm = _expectedPpm(sizes[0] + sizes[1] + sizes[2], R);
+        assertEq(total, _ceilFee(sumGross, ppm), "total fee is the schedule on the cumulative size");
+        assertLe(total, _ceilFee(sumGross, 20_000), "cap");
+        assertEq(l.ethPaid, total, "ledger");
+        assertEq(address(U.hook).balance + U.token.balanceOf(address(U.hook)), 0, "hook holds nothing");
+        assertEq(U.hook.pendingETH(), 0, "paid directly");
     }
 
     function test_cumulativeSoldIsVisibleWithinTheTransactionAndGoneAfter() public {
@@ -6682,6 +6980,13 @@ contract HookHandler is Asserts {
     uint256 public ghostHookBurns;
     bool public treasuryRejects;
     uint256 public calls;
+    string public lastDiag; // what the most recent mismatch was, for the failure message
+
+    function _mismatch(string memory what, uint256 got, uint256 want) internal {
+        feeMismatches++;
+        lastDiag =
+            string.concat(what, " [", _str(got), " != ", _str(want), "] lagged=", _str(hook.laggedTokenReserve()));
+    }
 
     constructor(
         PoolManager m,
@@ -6767,6 +7072,59 @@ contract HookHandler is Asserts {
             sellFailures++;
         }
         ghostHookBurns += supplyBefore - token.totalSupply();
+    }
+
+    /// @dev Two exact-input legs by the same actor inside ONE transaction for the hook. Legs are at least 0.2% of
+    ///      the snapshot, so the second leg's output always covers the repricing it can trigger and the total must
+    ///      be exactly the schedule on the cumulative size.
+    ///
+    ///      The invariant executor treats this handler as the top-level frame, so forge clears transient storage
+    ///      after every call the handler makes directly (exactly as it does for a test contract). The legs therefore
+    ///      run inside one external self-call, where they share a transaction, and the hook's counter is read there.
+    function sellSplitExactIn(uint256 seed, uint256 first, uint256 second) external {
+        calls++;
+        address a = _actor(seed);
+        uint256 snapshot = hook.laggedTokenReserve();
+        if (snapshot == 0) snapshot = hook.tokenReserve();
+        first = _bound(first, snapshot / 500, snapshot * 3 / 100);
+        second = _bound(second, snapshot / 500, snapshot * 3 / 100);
+        if (first + second > token.balanceOf(a)) return;
+        uint256[3] memory before = [TREASURY.balance, hook.pendingETH(), a.balance];
+        uint256 supplyBefore = token.totalSupply();
+        sellAttempts++;
+        (bool ok, uint256 counter) = this.twoLegsExactIn(a, first, second);
+        if (ok) {
+            uint256 fee = (TREASURY.balance - before[0]) + (hook.pendingETH() - before[1]);
+            uint256 gross = (a.balance - before[2]) + fee;
+            if (counter != first + second) _mismatch("split: cumulative counter", counter, first + second);
+            uint256 expected = _ceilFee(gross, _expectedPpm(first + second, hook.laggedTokenReserve()));
+            if (fee != expected) _mismatch("split: fee", fee, expected);
+            ghostTreasuryFees += TREASURY.balance - before[0];
+        } else {
+            sellFailures++;
+        }
+        ghostHookBurns += supplyBefore - token.totalSupply();
+    }
+
+    /// @dev Self-call only: both legs and the counter read share one transaction. Not an invariant target.
+    function twoLegsExactIn(address a, uint256 first, uint256 second) external returns (bool ok, uint256 counter) {
+        require(msg.sender == address(this), "self-call only");
+        vm.startPrank(a, a);
+        ok = _tryExactIn(first) && _tryExactIn(second);
+        vm.stopPrank();
+        counter = hook.cumulativeSold(a);
+    }
+
+    function _tryExactIn(uint256 amount) internal returns (bool) {
+        try swapRouter.swap(
+            key, SwapParams(false, -int256(amount), TickMath.MAX_SQRT_PRICE - 1), _settings(), ""
+        ) returns (
+            BalanceDelta
+        ) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     function sellExactOut(uint256 seed, uint256 ethOut) external {
@@ -6993,7 +7351,8 @@ contract IMDOHookInvariantTest is V4Fixture {
     }
 
     function targetSelectors() external view returns (FuzzSelector[] memory t) {
-        bytes4[] memory s = new bytes4[](16);
+        bytes4[] memory s = new bytes4[](17);
+        s[16] = HookHandler.sellSplitExactIn.selector;
         s[0] = HookHandler.sellExactIn.selector;
         s[1] = HookHandler.sellExactOut.selector;
         s[2] = HookHandler.buyExactIn.selector;
@@ -7041,7 +7400,8 @@ contract IMDOHookInvariantTest is V4Fixture {
         handler.donate(2, 1 ether, 100 ether);
         handler.burn(3, 100 ether);
         handler.transfer(0, 1, 50 ether);
-        assertEq(handler.sellAttempts(), 4, "sells attempted");
+        handler.sellSplitExactIn(0, 2_000 ether, 2_000 ether); // ~0.6% + ~0.6% in one tx: second leg bills both
+        assertEq(handler.sellAttempts(), 5, "sells attempted");
         assertEq(handler.sellFailures(), 0, "every sell went through");
         assertEq(handler.buyAttempts(), 2, "buys attempted");
         assertEq(handler.feeMismatches(), 0, "every fee matched the schedule");
@@ -7102,7 +7462,11 @@ contract IMDOHookInvariantTest is V4Fixture {
     function invariant_treasuryReceivesExactlyTheFeesInEth() public view {
         assertEq(TREASURY.balance, handler.ghostTreasuryFees(), "treasury balance != fees observed");
         assertEq(U.token.balanceOf(TREASURY), 0, "treasury received tokens");
-        assertEq(handler.feeMismatches(), 0, "a sell, buy or harvest was charged other than the schedule");
+        assertEq(
+            handler.feeMismatches(),
+            0,
+            string.concat("a sell, buy or harvest was charged other than the schedule: ", handler.lastDiag())
+        );
     }
 
     /// forge-config: default.invariant.runs = 40
